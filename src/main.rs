@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand};
-use std::{collections::HashMap, fmt::Display, fs::{self, read_dir}, hash::Hash, io::{self, Write}, path::Path, sync::mpsc::RecvTimeoutError};
+use std::{collections::HashMap, fmt::Display, fs::{self, read_dir}, hash::Hash, io::{self, BufRead, BufReader, Write}, net::{TcpListener, TcpStream}, path::Path, sync::{mpsc::{self, RecvTimeoutError}, Arc, Mutex}, thread::{self, JoinHandle}};
 
 #[derive(Parser)]
 #[command(name = "laj3", version, about)]
@@ -10,7 +10,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    #[command(about = "Coonstruct a dictionary from files")]
+    #[command(about = "Construct a dictionary from files")]
     Dict { 
         #[arg(short, long)]
         #[arg(help = "Output file to store the dictionary")]
@@ -23,6 +23,85 @@ enum Commands {
         #[arg(help = "Root directory to add to dictionary or single file")]
         root: String
     },
+    #[command(about = "Start laj3 server")]
+    Server {
+        #[arg(short, long)]
+        #[arg(help = "Port to listen to")]
+        port: i32
+    },
+}
+
+struct Worker {
+    id: usize,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl Worker {
+    fn new(id: usize, receiver: Arc<Mutex<mpsc::Receiver<Job>>>) -> Worker {
+        Worker { id, thread: Some(thread::spawn(move || loop { 
+            let message = receiver.lock().unwrap().recv();
+
+            match message {
+                Ok(job) => {
+                    println!("Worker {id} got a job; executing...");
+
+                    job();
+                },
+                Err(_) => {
+                    println!("Worker {id} disconnected; shutting down...");
+                    break;
+                }
+            }
+        })) }
+    }
+}
+
+struct ThreadPool {
+    workers: Vec<Worker>,
+    sender: Option<mpsc::Sender<Job>>,
+}
+
+type Job = Box<dyn FnOnce() + Send + 'static>;
+
+impl ThreadPool {
+    fn new(size: usize) -> ThreadPool {
+        assert!(size > 0);
+
+        let (sender, receiver) = mpsc::channel();
+
+        let receiver = Arc::new(Mutex::new(receiver));
+
+        let mut workers = Vec::with_capacity(size);
+
+        for i in 0..size {
+            workers.push(Worker::new(i, Arc::clone(&receiver)));
+        }
+
+        ThreadPool { workers, sender: Some(sender) }
+    }
+
+    fn execute<F>(&self, f: F)
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        let job = Box::new(f);
+        
+        self.sender.as_ref().unwrap().send(job).unwrap();
+    }
+}
+
+impl Drop for ThreadPool {
+    fn drop(&mut self) {
+        drop(self.sender.take());
+
+        for worker in &mut self.workers {
+            println!("Shutting down worker {}", worker.id);
+
+            if let Some(thread) = worker.thread.take() {
+                thread.join().unwrap();
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -103,5 +182,47 @@ fn main() {
                 }
             }
         },
+        Commands::Server { port } => {
+            let listener = TcpListener::bind(format!("127.0.0.1:{}", port));
+            let pool = ThreadPool::new(10);
+
+            match listener {
+                Ok(listener) => {
+                    if let Ok(addr) = listener.local_addr() {
+                        println!("Server started successfully. Listening on {}:{}", addr.ip().to_string(), addr.port());
+                    } else {
+                        eprintln!("Server started, but there was an error while trying to fetch listening ip and port.\nTrying to continue anyway...")
+                    }
+
+                    for stream in listener.incoming().take(6) {
+                        match stream {
+                            Ok(stream) => {
+                                println!("Connection established!");
+
+                                pool.execute(|| handle_connection(stream));
+                            },
+                            Err(e) => {
+                                eprintln!("Error while accepting connection to client: {}", e);
+                            }
+                        }
+                    }
+                },
+                Err(e) => {
+                    eprintln!("Error while binding to 127.0.0.1:{}: {}", port, e);
+                }
+            }
+        }
     };
+}
+
+fn handle_connection(mut stream: TcpStream) {
+    let buf_reader = BufReader::new(&mut stream);
+    let http_request: Vec<_> = buf_reader
+        .lines()
+        .map(|result| result.unwrap())
+        .take_while(|line| !line.is_empty())
+        .collect();
+
+    let response = "HTTP/1.1 200 OK\r\n\r\n";
+    stream.write_all(response.as_bytes()).unwrap();
 }
