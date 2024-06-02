@@ -1,5 +1,7 @@
 use clap::{Parser, Subcommand};
-use std::{collections::HashMap, fmt::Display, fs::{self, read_dir, File}, io::{BufRead, BufReader, BufWriter, Read, Write}, net::{TcpListener, TcpStream}, path::Path, sync::{mpsc, Arc, Mutex}, thread::{self, JoinHandle}};
+use serde_json::{json, Map, Value};
+use zip::{write::{FileOptions, SimpleFileOptions}, ZipWriter};
+use std::{collections::HashMap, fmt::Display, fs::{self, read_dir, File}, io::{self, BufRead, BufReader, BufWriter, Cursor, Error, Read, Write}, net::{TcpListener, TcpStream}, path::Path, sync::{mpsc, Arc, Mutex}, thread::{self, JoinHandle}};
 
 #[derive(Parser)]
 #[command(name = "laj3", version, about)]
@@ -238,37 +240,36 @@ fn main() {
                     println!("Connected to remote host {}:{}", stream.peer_addr().unwrap().ip(), stream.peer_addr().unwrap().port());
 
                     if file.is_some() {
-                        let f = File::open(file.as_ref().unwrap());
-
-                        match f {
-                            Ok(mut f) => {
-                                let mut content = String::new();
-                                if let Err(e) = f.read_to_string(&mut content) {
-                                    eprintln!("Error while reading dict file '{}': {}", file.as_ref().unwrap(), e);
-                                    return;
-                                }
-                                content.push_str("\r\n\r\n");
-
-                                let mut writer = BufWriter::new(&mut stream);
-                                writer.write_all(content.as_bytes()).unwrap();
-                                writer.flush().unwrap();
-                            },
-                            Err(e) => {
-                                eprintln!("Error while reading dict file '{}': {}", file.as_ref().unwrap(), e);
-                            }
-                        }
+                        send_file(&mut stream, file.as_ref().unwrap())
                     } else {
                         eprintln!("#NOT IMPLEMENTED YET");
                         return;
                     }
 
-                    let buf_reader = BufReader::new(&mut stream);
-                    let http_response: Vec<_> = buf_reader
-                        .lines()
-                        .map(|res| res.unwrap())
-                        .take_while(|line| !line.is_empty())
-                        .collect();
-                    println!("{:#?}", http_response);
+                    let mut compressed: Vec<u8> = Vec::new();
+                    let mut buf_reader = BufReader::new(&mut stream);
+                    
+                    if let Err(e) = buf_reader.read_to_end(&mut compressed) {
+                        eprintln!("Error while receiving files from server: {}", e);
+                        return;
+                    }
+
+                    let output_file = File::create("output.zip");
+
+                    match output_file {
+                        Ok(output_file) => {
+                            let mut buf_writer = BufWriter::new(output_file);
+
+                            if let Err(e) = buf_writer.write_all(&compressed) {
+                                eprintln!("Error while writing to output file: {}", e);
+                                return;
+                            }
+                        },
+                        Err(e) => {
+                            eprintln!("Error while creating output file: {}", e);
+                            return;
+                        }
+                    }
                 },
                 Err(e) => {
                     eprintln!("Error while trying to connect to remote server: {}", e);
@@ -280,15 +281,159 @@ fn main() {
 
 fn handle_connection(mut stream: TcpStream) {
     let buf_reader = BufReader::new(&mut stream);
-    let content = buf_reader
+    let client_dict_str = buf_reader
         .lines()
         .map(|result| result.unwrap())
         .take_while(|line| !line.is_empty())
         .collect::<Vec<String>>()
         .join("");
+    
+    let client_dict = serde_json::from_str::<Map<String, _>>(&client_dict_str);
 
-    println!("{}", content);
+    match client_dict {
+        Ok(client_dict) => {
+            let server_dict = read_dict("base.dict");
 
-    let response = "HTTP/1.1 200 OK\r\n\r\n";
-    stream.write_all(response.as_bytes()).unwrap();
+            match server_dict {
+                Ok(server_dict) => {
+                    let diffs = diff_dict(&client_dict, &server_dict);
+
+                    let compressed = compress_files(&diffs);
+                    
+                    if let Ok(compressed) = compressed {
+                        // let response = "HTTP/1.1 200 OK\r\n\r\n";
+                        stream.write_all(&compressed).unwrap();
+                    }
+                },
+                Err(_) => {
+                    //TODO: custom error system
+                }
+            }
+        },
+        Err(e) => {
+            eprintln!("Error while reading client dict: {}", e);
+        }
+    }
+}
+
+fn compress_files(paths: &Vec<String>) -> Result<Vec<u8>, ()> {
+    let bytes = Cursor::new(Vec::new());
+    let writer = BufWriter::new(bytes);
+    
+    let mut zip = ZipWriter::new(writer);
+    let options = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+
+    for path in paths {
+        if let Err(e) = zip.start_file(path.clone(), options) {
+            eprintln!("Error while preparing to compress {}: {}", path, e);
+            continue;
+        }
+
+        let file = File::open(&path);
+
+        match file {
+            Ok(file) => {
+                let mut buffer: Vec<u8> = Vec::new();
+                if let Err(e) = io::copy(&mut file.take(u64::MAX), &mut buffer) {
+                    eprintln!("Error while reading file {}: {}", &path, e);
+                    continue;
+                }
+                if let Err(e) = zip.write_all(&buffer) {
+                    eprintln!("Error while writing {} to zip: {}", &path, e);
+                    continue;
+                }
+            },
+            Err(e) => {
+                eprintln!("Error while opening file {}: {}", &path, e);
+                continue;
+            }
+        }
+    }
+
+    match zip.finish() {
+        Ok(writer) => {
+            match writer.into_inner() {
+                Ok(cursor) => {
+                    Ok(cursor.into_inner())
+                },
+                Err(e) => {
+                    eprintln!("Error while retrieving compressed bytes: {}", e);
+                    Err(())
+                }
+            }
+        },
+        Err(e) => {
+            eprintln!("Error while zipping files: {}", e);
+            Err(())
+        }
+    }
+}
+
+fn read_dict(path: &str) -> Result<Map<String, serde_json::Value>, ()> {
+    let f = File::open(path);
+    let mut content = String::new();
+    match f {
+        Ok(mut f) => {
+            if let Err(e) = f.read_to_string(&mut content) {
+                eprintln!("Error while reading dict file '{}': {}", path, e);
+                return Err(());
+            }
+
+            let dict = serde_json::from_str::<Map<String, _>>(&content);
+
+            match dict {
+                Ok(dict) => {
+                    println!("{:#?}", dict);
+                    Ok(dict)
+                },
+                Err(e) => {
+                    eprintln!("Error while reading client dict: {}", e);
+                    Err(())
+                }
+            }
+        },
+        Err(e) => {
+            eprintln!("Error while reading dict file '{}': {}", path, e);
+            Err(())
+        }
+    }
+}
+
+fn diff_dict(dict1: &Map<String, Value>, dict2: &Map<String, Value>) -> Vec<String> {
+    let mut diffs: Vec<String> = Vec::new();
+
+    for (k, v) in dict1 {
+        if !dict2.contains_key(k) || !v.eq(dict2.get(k).unwrap()) {
+            diffs.push(k.clone());
+        }
+    }
+
+    for (k, v) in dict2 {
+        if !dict1.contains_key(k) {
+            diffs.push(k.clone());
+        }
+    }
+
+    diffs
+}
+
+fn send_file(mut stream: &mut TcpStream, path: &str) {
+    let f = File::open(path);
+    let mut content = String::new();
+    match f {
+        Ok(mut f) => {
+            if let Err(e) = f.read_to_string(&mut content) {
+                eprintln!("Error while reading dict file '{}': {}", path, e);
+                return;
+            }
+            content.push_str("\r\n\r\n");
+
+            let mut writer = BufWriter::new(&mut stream);
+            writer.write_all(content.as_bytes()).unwrap();
+            writer.flush().unwrap();
+        },
+        Err(e) => {
+            eprintln!("Error while reading dict file '{}': {}", path, e);
+        }
+    }
 }
