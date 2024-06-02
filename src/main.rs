@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand};
-use std::{collections::HashMap, fmt::Display, fs::{self, read_dir}, hash::Hash, io::{self, BufRead, BufReader, Write}, net::{TcpListener, TcpStream}, path::Path, sync::{mpsc::{self, RecvTimeoutError}, Arc, Mutex}, thread::{self, JoinHandle}};
+use std::{collections::HashMap, fmt::Display, fs::{self, read_dir, File}, io::{BufRead, BufReader, BufWriter, Read, Write}, net::{TcpListener, TcpStream}, path::Path, sync::{mpsc, Arc, Mutex}, thread::{self, JoinHandle}};
 
 #[derive(Parser)]
 #[command(name = "laj3", version, about)]
@@ -28,6 +28,15 @@ enum Commands {
         #[arg(short, long)]
         #[arg(help = "Port to listen to")]
         port: i32
+    },
+    #[command(about = "Download from server")]
+    Install {
+        #[arg(short, long)]
+        #[arg(help = "Use a pre-computed dictionary file")]
+        file: Option<String>,
+
+        #[arg(help = "HTTP URI to the resource")]
+        uri: String
     },
 }
 
@@ -194,7 +203,7 @@ fn main() {
                         eprintln!("Server started, but there was an error while trying to fetch listening ip and port.\nTrying to continue anyway...")
                     }
 
-                    for stream in listener.incoming().take(6) {
+                    for stream in listener.incoming() {
                         match stream {
                             Ok(stream) => {
                                 println!("Connection established!");
@@ -211,17 +220,74 @@ fn main() {
                     eprintln!("Error while binding to 127.0.0.1:{}: {}", port, e);
                 }
             }
+        },
+        Commands::Install { uri, file } => {
+            let split_uri = uri.split_once("/");
+
+            if split_uri.is_none() {
+                eprintln!("Error: invalid request URI.");
+                return;
+            }
+
+            let (address, path) = split_uri.unwrap();
+
+            let stream = TcpStream::connect(address);
+
+            match stream {
+                Ok(mut stream) => {
+                    println!("Connected to remote host {}:{}", stream.peer_addr().unwrap().ip(), stream.peer_addr().unwrap().port());
+
+                    if file.is_some() {
+                        let f = File::open(file.as_ref().unwrap());
+
+                        match f {
+                            Ok(mut f) => {
+                                let mut content = String::new();
+                                if let Err(e) = f.read_to_string(&mut content) {
+                                    eprintln!("Error while reading dict file '{}': {}", file.as_ref().unwrap(), e);
+                                    return;
+                                }
+                                content.push_str("\r\n\r\n");
+
+                                let mut writer = BufWriter::new(&mut stream);
+                                writer.write_all(content.as_bytes()).unwrap();
+                                writer.flush().unwrap();
+                            },
+                            Err(e) => {
+                                eprintln!("Error while reading dict file '{}': {}", file.as_ref().unwrap(), e);
+                            }
+                        }
+                    } else {
+                        eprintln!("#NOT IMPLEMENTED YET");
+                        return;
+                    }
+
+                    let buf_reader = BufReader::new(&mut stream);
+                    let http_response: Vec<_> = buf_reader
+                        .lines()
+                        .map(|res| res.unwrap())
+                        .take_while(|line| !line.is_empty())
+                        .collect();
+                    println!("{:#?}", http_response);
+                },
+                Err(e) => {
+                    eprintln!("Error while trying to connect to remote server: {}", e);
+                }
+            }
         }
     };
 }
 
 fn handle_connection(mut stream: TcpStream) {
     let buf_reader = BufReader::new(&mut stream);
-    let http_request: Vec<_> = buf_reader
+    let content = buf_reader
         .lines()
         .map(|result| result.unwrap())
         .take_while(|line| !line.is_empty())
-        .collect();
+        .collect::<Vec<String>>()
+        .join("");
+
+    println!("{}", content);
 
     let response = "HTTP/1.1 200 OK\r\n\r\n";
     stream.write_all(response.as_bytes()).unwrap();
