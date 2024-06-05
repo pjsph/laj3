@@ -155,7 +155,8 @@ fn add_to_dict(path: &Path, recursive: bool, level: i8) -> HashMap<String, Strin
     } else {
         match hash_file(path) {
             Ok(hash) => {
-                dictionary.insert(String::from(path.to_string_lossy()), hash);
+                let fixed_path = &String::from(path.to_string_lossy())[2..];
+                dictionary.insert(String::from(fixed_path), hash);
             },
             Err(e) => eprintln!("Error while adding {} to the dictionary: {}", path.to_string_lossy(), e)
         }
