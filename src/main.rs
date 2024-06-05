@@ -1,6 +1,6 @@
 use clap::{Parser, Subcommand};
 use serde_json::{json, Map, Value};
-use zip::{write::{FileOptions, SimpleFileOptions}, ZipWriter};
+use zip::{write::{FileOptions, SimpleFileOptions}, ZipArchive, ZipWriter};
 use std::{collections::HashMap, fmt::Display, fs::{self, read_dir, File}, io::{self, BufRead, BufReader, BufWriter, Cursor, Error, Read, Write}, net::{TcpListener, TcpStream}, path::Path, sync::{mpsc, Arc, Mutex}, thread::{self, JoinHandle}};
 
 #[derive(Parser)]
@@ -17,6 +17,10 @@ enum Commands {
         #[arg(short, long)]
         #[arg(help = "Output file to store the dictionary")]
         output: Option<String>,
+
+        #[arg(short, long)]
+        #[arg(help = "Create empty dictionary", default_value_t = false)]
+        empty: bool,
 
         #[arg(short, long, default_value_t = false)]
         #[arg(help = "Compute dictionary for subdirectories")]
@@ -171,10 +175,14 @@ fn main() {
     let dictionary: HashMap<String, String>;
 
     match &cli.command {
-        Commands::Dict{ output, recursive, root } => {
+        Commands::Dict{ output, empty, recursive, root } => {
             let p = Path::new(root);
 
-            dictionary = add_to_dict(p, *recursive, 0);
+            if !empty {
+                dictionary = add_to_dict(p, *recursive, 0);
+            } else {
+                dictionary = HashMap::new();
+            }
 
             match output {
                 Some(output_path) => {
@@ -255,22 +263,24 @@ fn main() {
                         return;
                     }
 
-                    let output_file = File::create("output.zip");
+                    extract_files(&compressed);
 
-                    match output_file {
-                        Ok(output_file) => {
-                            let mut buf_writer = BufWriter::new(output_file);
+                    // let output_file = File::create("output.zip");
 
-                            if let Err(e) = buf_writer.write_all(&compressed) {
-                                eprintln!("Error while writing to output file: {}", e);
-                                return;
-                            }
-                        },
-                        Err(e) => {
-                            eprintln!("Error while creating output file: {}", e);
-                            return;
-                        }
-                    }
+                    // match output_file {
+                    //     Ok(output_file) => {
+                    //         let mut buf_writer = BufWriter::new(output_file);
+
+                    //         if let Err(e) = buf_writer.write_all(&compressed) {
+                    //             eprintln!("Error while writing to output file: {}", e);
+                    //             return;
+                    //         }
+                    //     },
+                    //     Err(e) => {
+                    //         eprintln!("Error while creating output file: {}", e);
+                    //         return;
+                    //     }
+                    // }
                 },
                 Err(e) => {
                     eprintln!("Error while trying to connect to remote server: {}", e);
@@ -366,6 +376,24 @@ fn compress_files(paths: &Vec<String>) -> Result<Vec<u8>, ()> {
         Err(e) => {
             eprintln!("Error while zipping files: {}", e);
             Err(())
+        }
+    }
+}
+
+fn extract_files(compressed: &Vec<u8>) {
+    let cursor = Cursor::new(compressed);
+    let reader = BufReader::new(cursor);
+
+    match ZipArchive::new(reader) {
+        Ok(mut zip) => {
+            if let Err(e) = zip.extract(Path::new(".")) {
+                eprintln!("Error while extracting received data: {}", e);
+                return;
+            }
+        },
+        Err(e) => {
+            eprintln!("Failed to read compressed files received from server: {}", e);
+            return;
         }
     }
 }
