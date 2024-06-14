@@ -1,7 +1,7 @@
 use clap::{Parser, Subcommand};
-use serde_json::{json, Map, Value};
-use zip::{write::{FileOptions, SimpleFileOptions}, ZipArchive, ZipWriter};
-use std::{collections::HashMap, fmt::Display, fs::{self, read_dir, File}, io::{self, BufRead, BufReader, BufWriter, Cursor, Error, Read, Write}, net::{TcpListener, TcpStream}, path::Path, sync::{mpsc, Arc, Mutex}, thread::{self, JoinHandle}};
+use serde_json::{Map, Value};
+use zip::{write::SimpleFileOptions, ZipArchive, ZipWriter};
+use std::{collections::HashMap, fmt::Display, fs::{self, read_dir, remove_file, File}, io::{self, BufRead, BufReader, BufWriter, Cursor, Read, Write}, net::{TcpListener, TcpStream}, path::Path, sync::{mpsc, Arc, Mutex}, thread::{self, JoinHandle}};
 
 #[derive(Parser)]
 #[command(name = "laj3", version, about)]
@@ -33,7 +33,11 @@ enum Commands {
     Server {
         #[arg(short, long)]
         #[arg(help = "Port to listen to")]
-        port: i32
+        port: i32,
+
+        #[arg(short, long)]
+        #[arg(help = "Dictionary file for the project")]
+        file: String
     },
     #[command(about = "Download from server")]
     Install {
@@ -202,7 +206,7 @@ fn main() {
                 }
             }
         },
-        Commands::Server { port } => {
+        Commands::Server { port, file } => {
             let listener = TcpListener::bind(format!("127.0.0.1:{}", port));
             let pool = ThreadPool::new(10);
 
@@ -218,8 +222,8 @@ fn main() {
                         match stream {
                             Ok(stream) => {
                                 println!("Connection established!");
-
-                                pool.execute(|| handle_connection(stream));
+                                let server_dict_path = file.clone();
+                                pool.execute(|| handle_connection(stream, server_dict_path));
                             },
                             Err(e) => {
                                 eprintln!("Error while accepting connection to client: {}", e);
@@ -240,7 +244,7 @@ fn main() {
                 return;
             }
 
-            let (address, path) = split_uri.unwrap();
+            let (address, _path) = split_uri.unwrap();
 
             let stream = TcpStream::connect(address);
 
@@ -263,7 +267,19 @@ fn main() {
                         return;
                     }
 
-                    extract_files(&compressed);
+                    let (to_delete, offset) = get_to_delete(&mut compressed);
+                    
+                    for td in to_delete {
+                        if td.is_empty() {
+                            continue;
+                        }
+
+                        if let Err(e) = remove_file(&td) {
+                            eprintln!("Warning while deleting file {}: {}", td, e);
+                        }
+                    }
+
+                    extract_files(&compressed[offset..]);
 
                     // let output_file = File::create("output.zip");
 
@@ -290,7 +306,7 @@ fn main() {
     };
 }
 
-fn handle_connection(mut stream: TcpStream) {
+fn handle_connection(mut stream: TcpStream, server_dict_path: String) {
     let buf_reader = BufReader::new(&mut stream);
     let client_dict_str = buf_reader
         .lines()
@@ -303,16 +319,29 @@ fn handle_connection(mut stream: TcpStream) {
 
     match client_dict {
         Ok(client_dict) => {
-            let server_dict = read_dict("base.dict");
+            let server_dict = read_dict(&server_dict_path);
 
             match server_dict {
                 Ok(server_dict) => {
                     let diffs = diff_dict(&client_dict, &server_dict);
 
-                    let compressed = compress_files(&diffs);
-                    
+                    let to_send: Vec<&String> = diffs.iter().filter(|e| match e.0 {
+                        Diff::ADDED | Diff::CHANGED => true,
+                        _ => false
+                    }).map(|e| &e.1).collect();
+                    let to_delete: Vec<&String> = diffs.iter().filter(|e| match e.0 {
+                        Diff::REMOVED => true,
+                        _ => false
+                    }).map(|e| &e.1).collect();
+
+                    let compressed = compress_files(to_send);
                     if let Ok(compressed) = compressed {
                         // let response = "HTTP/1.1 200 OK\r\n\r\n";
+                        for td in to_delete {
+                            stream.write_all(td.as_bytes()).unwrap();
+                            stream.write_all("\n".as_bytes()).unwrap()
+                        }
+                        stream.write_all("\r\n\r\n".as_bytes()).unwrap();
                         stream.write_all(&compressed).unwrap();
                     }
                 },
@@ -327,7 +356,7 @@ fn handle_connection(mut stream: TcpStream) {
     }
 }
 
-fn compress_files(paths: &Vec<String>) -> Result<Vec<u8>, ()> {
+fn compress_files(paths: Vec<&String>) -> Result<Vec<u8>, ()> {
     let bytes = Cursor::new(Vec::new());
     let writer = BufWriter::new(bytes);
     
@@ -380,7 +409,7 @@ fn compress_files(paths: &Vec<String>) -> Result<Vec<u8>, ()> {
     }
 }
 
-fn extract_files(compressed: &Vec<u8>) {
+fn extract_files(compressed: &[u8]) {
     let cursor = Cursor::new(compressed);
     let reader = BufReader::new(cursor);
 
@@ -396,6 +425,15 @@ fn extract_files(compressed: &Vec<u8>) {
             return;
         }
     }
+}
+
+fn get_to_delete(data: &Vec<u8>) -> (Vec<String>, usize) {
+    let data_str = String::from_utf8_lossy(data);
+    let to_delete = data_str.split("\r\n\r\n").next().unwrap();
+
+    let offset = to_delete.as_bytes().len() + "\r\n\r\n".as_bytes().len();
+
+    (to_delete.split("\n").map(|s| String::from(s)).collect(), offset)
 }
 
 fn read_dict(path: &str) -> Result<Map<String, serde_json::Value>, ()> {
@@ -428,18 +466,26 @@ fn read_dict(path: &str) -> Result<Map<String, serde_json::Value>, ()> {
     }
 }
 
-fn diff_dict(dict1: &Map<String, Value>, dict2: &Map<String, Value>) -> Vec<String> {
-    let mut diffs: Vec<String> = Vec::new();
+enum Diff {
+    ADDED,
+    REMOVED,
+    CHANGED
+}
+
+fn diff_dict(dict1: &Map<String, Value>, dict2: &Map<String, Value>) -> Vec<(Diff, String)> {
+    let mut diffs: Vec<(Diff, String)> = Vec::new();
 
     for (k, v) in dict1 {
-        if !dict2.contains_key(k) || !v.eq(dict2.get(k).unwrap()) {
-            diffs.push(k.clone());
+        if !dict2.contains_key(k) {
+            diffs.push((Diff::REMOVED, k.clone()));
+        } else if !v.eq(dict2.get(k).unwrap()) {
+            diffs.push((Diff::CHANGED, k.clone()));
         }
     }
 
-    for (k, v) in dict2 {
+    for (k, _) in dict2 {
         if !dict1.contains_key(k) {
-            diffs.push(k.clone());
+            diffs.push((Diff::ADDED, k.clone()));
         }
     }
 
